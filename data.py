@@ -99,38 +99,56 @@ def _listing_naver(per_market: int = 450) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+MIN_USABLE_ROWS = 300  # 필터 적용 후 이 수 미만이면 '쓸 수 없는 목록'으로 보고 다음 출처를 시도
+
+
+def _filter_listing(listing: pd.DataFrame) -> pd.DataFrame:
+    """분석 대상만 남긴다: 코스피/코스닥 보통주, 스팩 제외, 시가총액이 있는 종목."""
+    out = listing[listing["Market"].isin(["KOSPI", "KOSDAQ"])].copy()
+    out["Marcap"] = pd.to_numeric(out["Marcap"], errors="coerce")
+    out = out[out["Code"].astype(str).str.endswith("0")]  # 우선주(끝자리 0 아님) 제외
+    out = out[~out["Name"].str.contains("스팩|제[0-9]+호", regex=True, na=False)]
+    out = out[out["Marcap"] > 0]
+    out["Industry"] = out["Industry"].fillna("기타")
+    return out
+
+
 def _get_listing() -> tuple[pd.DataFrame, str]:
-    """오늘자 저장본 → KRX → 네이버 → (마지막 성공한) 저장본 순으로 시도."""
+    """오늘자 저장본 → KRX → 네이버 → (마지막 성공한) 저장본 순으로 시도.
+
+    '행이 있다'가 아니라 '필터 후 쓸 수 있는 행이 충분하다'를 기준으로 판단한다.
+    (예: KRX가 시가총액이 빈 목록을 주면 다음 출처로 넘어간다)
+    """
     if LISTING_CACHE.exists():
         stamp = dt.date.fromtimestamp(LISTING_CACHE.stat().st_mtime)
         if stamp == dt.date.today():
             cached = pd.read_pickle(LISTING_CACHE)
-            return cached, cached.attrs.get("source", "cache")
+            if len(_filter_listing(cached)) >= MIN_USABLE_ROWS:
+                return cached, cached.attrs.get("source", "cache")
     errors = []
     # 소스별 시간 제한: KRX는 막히면 응답이 없을 수 있어 짧게, 네이버는 요청이 많아 길게
     for name, fn, limit in (("KRX", _listing_krx, 25), ("NAVER", _listing_naver, 180)):
         try:
             df = _call_with_timeout(fn, limit)
-            if len(df) > 100:
+            usable = len(_filter_listing(df))
+            if usable >= MIN_USABLE_ROWS:
                 df.attrs["source"] = name
                 df.to_pickle(LISTING_CACHE)
                 return df, name
+            errors.append(f"{name}: 쓸 수 있는 종목 {usable}개 (원본 {len(df)}행)")
         except Exception as e:  # 차단/네트워크 오류 → 다음 경로
             errors.append(f"{name}: {type(e).__name__}")
     if LISTING_CACHE.exists():
-        return pd.read_pickle(LISTING_CACHE), "stale-cache"
-    raise RuntimeError("종목 목록을 가져오지 못했습니다 (" + ", ".join(errors) + ")")
+        stale = pd.read_pickle(LISTING_CACHE)
+        if len(_filter_listing(stale)) >= MIN_USABLE_ROWS:
+            return stale, "stale-cache"
+    raise RuntimeError("종목 목록을 가져오지 못했습니다 (" + "; ".join(errors) + ")")
 
 
 def load_universe(n_kospi: int, n_kosdaq: int) -> pd.DataFrame:
     """시가총액 상위 종목 목록 (스팩/우선주 등 제외). 출처는 결과의 attrs['listing_source']."""
-    listing, source = _get_listing()
-    listing = listing[listing["Market"].isin(["KOSPI", "KOSDAQ"])].copy()
-    # 우선주(코드 끝자리가 0이 아님)와 스팩 제외
-    listing = listing[listing["Code"].str.endswith("0")]
-    listing = listing[~listing["Name"].str.contains("스팩|제[0-9]+호", regex=True, na=False)]
-    listing = listing[listing["Marcap"] > 0]
-    listing["Industry"] = listing["Industry"].fillna("기타")
+    listing_raw, source = _get_listing()
+    listing = _filter_listing(listing_raw)
 
     parts = []
     for market, n in (("KOSPI", n_kospi), ("KOSDAQ", n_kosdaq)):
