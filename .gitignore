@@ -1,0 +1,8 @@
+.venv/
+.cache/
+.browser/
+.logs/
+__pycache__/
+*.pyc
+*.pkl
+.env
